@@ -832,3 +832,345 @@ if __name__ == "__main__":
         left_col=left_col,
         sample_idx=0,
     )
+
+
+
+
+
+
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+class MergeRefineOracle4Param(nn.Module):
+    """
+    각 class는 4개 파라미터를 가짐:
+      v_left_raw  : 왼쪽 경계의 vertical displacement raw
+      u_top_raw   : 위쪽 경계의 horizontal displacement raw
+      decay_x_raw : 왼쪽 경계 motion의 가로 감쇠율 raw
+      decay_y_raw : 위쪽 경계 motion의 세로 감쇠율 raw
+
+    최종 flow는:
+      dx(x,y) = u_top  * exp(-decay_y * y_norm)
+      dy(x,y) = v_left * exp(-decay_x * x_norm)
+
+    여기서
+      u_top  = max_shift * tanh(u_top_raw)
+      v_left = max_shift * tanh(v_left_raw)
+
+    즉,
+      - top boundary에서 horizontal motion이 가장 크고 아래로 갈수록 감소
+      - left boundary에서 vertical motion이 가장 크고 오른쪽으로 갈수록 감소
+    """
+
+    def __init__(self, max_shift=0.5):
+        super().__init__()
+        self.num_classes = 8
+        self.max_shift = float(max_shift)
+
+        # 각 row = [v_left_raw, u_top_raw, decay_x_raw, decay_y_raw]
+        # tanh(raw) * max_shift 가 실제 경계 이동량
+        # softplus(raw) 가 실제 decay
+        init = torch.tensor([
+            [ 0.0,  0.0,  2.0,  2.0],   # 0: no-op
+            [ 0.0,  2.0,  2.0,  2.0],   # 1: top -> x+
+            [ 0.0, -2.0,  2.0,  2.0],   # 2: top -> x-
+            [ 2.0,  0.0,  2.0,  2.0],   # 3: left -> y+
+            [-2.0,  0.0,  2.0,  2.0],   # 4: left -> y-
+            [ 2.0,  2.0,  2.0,  2.0],   # 5: diag (+x,+y)
+            [-2.0, -2.0,  2.0,  2.0],   # 6: diag (-x,-y)
+            [ 2.0, -2.0,  2.0,  2.0],   # 7: mixed (-x,+y)
+        ], dtype=torch.float32)
+
+        self.class_params = nn.Parameter(init)  # [8,4]
+
+    @staticmethod
+    def make_xy_maps(h, w, device, dtype):
+        yy, xx = torch.meshgrid(
+            torch.linspace(0.0, 1.0, h, device=device, dtype=dtype),
+            torch.linspace(0.0, 1.0, w, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        return xx, yy
+
+    @staticmethod
+    def make_base_grid(h, w, device, dtype):
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        return torch.stack([xx, yy], dim=-1)  # [H,W,2]
+
+    def build_flow_from_params(self, params, h, w, device, dtype):
+        v_left_raw, u_top_raw, decay_x_raw, decay_y_raw = params.unbind(dim=0)
+
+        v_left = self.max_shift * torch.tanh(v_left_raw)
+        u_top = self.max_shift * torch.tanh(u_top_raw)
+
+        decay_x = F.softplus(decay_x_raw)
+        decay_y = F.softplus(decay_y_raw)
+
+        xx, yy = self.make_xy_maps(h, w, device, dtype)
+
+        # top boundary horizontal motion
+        wx = torch.exp(-decay_y * yy)   # y=0에서 최대, 아래로 갈수록 감소
+        dx = u_top * wx
+
+        # left boundary vertical motion
+        wy = torch.exp(-decay_x * xx)   # x=0에서 최대, 오른쪽으로 갈수록 감소
+        dy = v_left * wy
+
+        flow = torch.stack([dx, dy], dim=-1)  # [H,W,2]
+        aux = {
+            "v_left": float(v_left.detach().cpu()),
+            "u_top": float(u_top.detach().cpu()),
+            "decay_x": float(decay_x.detach().cpu()),
+            "decay_y": float(decay_y.detach().cpu()),
+            "wx": wx.detach(),
+            "wy": wy.detach(),
+            "dx": dx.detach(),
+            "dy": dy.detach(),
+        }
+        return flow, aux
+
+    def warp(self, x, flow):
+        """
+        x:    [B,C,H,W]
+        flow: [B,H,W,2] in pixel units
+        """
+        b, c, h, w = x.shape
+        device, dtype = x.device, x.dtype
+
+        base_grid = self.make_base_grid(h, w, device, dtype)
+        base_grid = base_grid.unsqueeze(0).expand(b, h, w, 2).contiguous()
+
+        norm_dx = 2.0 * flow[..., 0] / max(w - 1, 1)
+        norm_dy = 2.0 * flow[..., 1] / max(h - 1, 1)
+
+        grid = base_grid.clone()
+        grid[..., 0] += norm_dx
+        grid[..., 1] += norm_dy
+
+        warped = F.grid_sample(
+            x, grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+        return warped
+
+    def forward(self, predictor, gt):
+        b, c, h, w = predictor.shape
+        device, dtype = predictor.device, predictor.dtype
+
+        all_warped = []
+        all_mse = []
+        all_flow = []
+        all_aux = []
+
+        for k in range(self.num_classes):
+            flow_k, aux_k = self.build_flow_from_params(
+                self.class_params[k], h, w, device, dtype
+            )
+
+            flow_k_b = flow_k.unsqueeze(0).expand(b, h, w, 2)
+            warped_k = self.warp(predictor, flow_k_b)
+
+            mse_k = ((warped_k - gt) ** 2).mean(dim=(1, 2, 3))  # [B]
+
+            all_warped.append(warped_k)
+            all_mse.append(mse_k)
+            all_flow.append(flow_k.detach())
+            all_aux.append(aux_k)
+
+        all_warped = torch.stack(all_warped, dim=1)  # [B,8,C,H,W]
+        all_mse = torch.stack(all_mse, dim=1)        # [B,8]
+
+        best_idx = all_mse.argmin(dim=1)
+        best_mse = all_mse.gather(1, best_idx[:, None]).squeeze(1)
+
+        gather_idx = best_idx.view(b, 1, 1, 1, 1).expand(
+            b, 1, predictor.size(1), predictor.size(2), predictor.size(3)
+        )
+        best_warped = all_warped.gather(1, gather_idx).squeeze(1)
+
+        return {
+            "best_warped": best_warped,
+            "best_idx": best_idx,
+            "best_mse": best_mse,
+            "all_warped": all_warped,
+            "all_mse": all_mse,
+            "all_flow": all_flow,
+            "all_aux": all_aux,
+        }
+
+
+def make_demo_predictor_and_gt(h=32, w=32, device="cpu"):
+    """
+    predictor와 gt를 일부러 살짝 어긋나게 만들어서
+    refine이 어떻게 보이는지 확인하기 위한 toy 예시
+    """
+    yy, xx = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32, device=device),
+        torch.arange(w, dtype=torch.float32, device=device),
+        indexing="ij"
+    )
+
+    gt = (
+        0.2
+        + 0.3 * (xx / (w - 1))
+        + 0.2 * (yy / (h - 1))
+        + 0.25 * ((xx + yy) > (0.9 * w)).float()
+    )
+
+    cx, cy = 0.35 * w, 0.55 * h
+    rr = ((xx - cx) ** 2 + (yy - cy) ** 2).sqrt()
+    gt = gt + 0.25 * torch.exp(-(rr ** 2) / (2 * (0.12 * w) ** 2))
+    gt = gt.clamp(0.0, 1.0)
+
+    predictor = torch.roll(gt, shifts=(-1, -1), dims=(0, 1))
+    predictor = 0.8 * predictor + 0.2 * torch.roll(predictor, shifts=(0, 1), dims=(0, 1))
+    predictor = predictor.clamp(0.0, 1.0)
+
+    predictor = predictor.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    gt = gt.unsqueeze(0).unsqueeze(0)                # [1,1,H,W]
+    return predictor, gt
+
+
+def visualize_refinement(model, predictor, gt, sample_idx=0, quiver_stride=4):
+    out = model(predictor, gt)
+
+    pred_img = predictor[sample_idx, 0].detach().cpu()
+    gt_img = gt[sample_idx, 0].detach().cpu()
+
+    best_idx = int(out["best_idx"][sample_idx].item())
+    best_mse = float(out["best_mse"][sample_idx].item())
+
+    print(f"Best class index: {best_idx}")
+    print(f"Best MSE        : {best_mse:.6f}")
+    print()
+
+    for k in range(model.num_classes):
+        aux = out["all_aux"][k]
+        mse = float(out["all_mse"][sample_idx, k].item())
+        print(
+            f"class {k}: "
+            f"u_top={aux['u_top']:+.3f}, v_left={aux['v_left']:+.3f}, "
+            f"decay_x={aux['decay_x']:.3f}, decay_y={aux['decay_y']:.3f}, "
+            f"MSE={mse:.6f}"
+        )
+
+    # ---- Figure 1: predictor / gt / best ----
+    best_img = out["best_warped"][sample_idx, 0].detach().cpu()
+
+    fig1, axes = plt.subplots(1, 4, figsize=(16, 4))
+    axes[0].imshow(pred_img, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("Predictor")
+    axes[1].imshow(gt_img, cmap="gray", vmin=0, vmax=1)
+    axes[1].set_title("GT")
+    axes[2].imshow(best_img, cmap="gray", vmin=0, vmax=1)
+    axes[2].set_title(f"Best refined\nclass={best_idx}")
+    axes[3].imshow((best_img - gt_img).abs(), cmap="magma")
+    axes[3].set_title("|Best - GT|")
+    for ax in axes:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Figure 2: class 결과 ----
+    n = model.num_classes
+    ncols = 4
+    nrows = math.ceil(n / ncols)
+
+    fig2, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    axes = axes.flatten()
+
+    for k in range(model.num_classes):
+        warped = out["all_warped"][sample_idx, k, 0].detach().cpu()
+        mse = float(out["all_mse"][sample_idx, k].item())
+        axes[k].imshow(warped, cmap="gray", vmin=0, vmax=1)
+        axes[k].set_title(f"class {k}\nMSE={mse:.5f}")
+        axes[k].axis("off")
+
+    for k in range(model.num_classes, len(axes)):
+        axes[k].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Figure 3: flow 시각화 ----
+    fig3, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    axes = axes.flatten()
+
+    for k in range(model.num_classes):
+        flow = out["all_flow"][k].cpu()
+        dx = flow[..., 0]
+        dy = flow[..., 1]
+        mag = torch.sqrt(dx ** 2 + dy ** 2)
+
+        axes[k].imshow(mag, cmap="viridis")
+        axes[k].set_title(f"class {k} |flow|")
+        axes[k].axis("off")
+
+        h, w = dx.shape
+        ys = torch.arange(0, h, quiver_stride)
+        xs = torch.arange(0, w, quiver_stride)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+        axes[k].quiver(
+            xx.numpy(),
+            yy.numpy(),
+            dx[yy, xx].numpy(),
+            dy[yy, xx].numpy(),
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.003,
+        )
+
+    for k in range(model.num_classes, len(axes)):
+        axes[k].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    # ---- Figure 4: dx / dy / wx / wy 를 best class 기준으로 자세히 ----
+    best_aux = out["all_aux"][best_idx]
+    dx = best_aux["dx"].cpu()
+    dy = best_aux["dy"].cpu()
+    wx = best_aux["wx"].cpu()
+    wy = best_aux["wy"].cpu()
+
+    fig4, axes = plt.subplots(1, 4, figsize=(18, 4))
+    axes[0].imshow(wx, cmap="viridis")
+    axes[0].set_title(f"best class {best_idx}\nwx (top->down decay)")
+    axes[1].imshow(wy, cmap="viridis")
+    axes[1].set_title(f"best class {best_idx}\nwy (left->right decay)")
+    axes[2].imshow(dx, cmap="coolwarm")
+    axes[2].set_title("dx")
+    axes[3].imshow(dy, cmap="coolwarm")
+    axes[3].set_title("dy")
+    for ax in axes:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    predictor, gt = make_demo_predictor_and_gt(h=32, w=32, device="cpu")
+
+    model = MergeRefineOracle4Param(max_shift=0.5)
+
+    visualize_refinement(model, predictor, gt, sample_idx=0, quiver_stride=4)
+
+
+
+
