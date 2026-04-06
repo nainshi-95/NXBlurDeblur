@@ -306,3 +306,510 @@ if __name__ == "__main__":
     model = MergeRefineOracle4Param()
 
     visualize_refinement(model, predictor, gt, sample_idx=0, quiver_stride=4)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
+# =========================================================
+# 1) Oracle refine model
+# =========================================================
+class MergeRefineOracle4Param(nn.Module):
+    """
+    9개 class 각각이 (ax, ay, cx, cy)를 가짐.
+
+    ax, ay : x/y 기본 이동량 (pixel unit)
+    cx, cy : center participation (sigmoid -> 0~1)
+
+    최종 flow:
+      dx(x,y) = ax * (cx + (1-cx) * decay(x,y))
+      dy(x,y) = ay * (cy + (1-cy) * decay(x,y))
+
+    predictor를 9개 방식으로 warp한 뒤,
+    gt와의 MSE가 가장 작은 class를 oracle-best로 선택.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.num_classes = 9
+
+        # [ax, ay, cx_raw, cy_raw]
+        init = torch.tensor([
+            [ 0.00,  0.00,  8.0,  8.0],   # 0: no-op
+            [ 0.25,  0.00, -8.0, -8.0],   # 1: x+
+            [-0.25,  0.00, -8.0, -8.0],   # 2: x-
+            [ 0.00,  0.25, -8.0, -8.0],   # 3: y+
+            [ 0.00, -0.25, -8.0, -8.0],   # 4: y-
+            [ 0.25,  0.25, -8.0, -8.0],   # 5: diag ++
+            [-0.25, -0.25, -8.0, -8.0],   # 6: diag --
+            [ 0.00,  0.25,  0.0, -2.0],   # 7: top-ish
+            [ 0.25,  0.00, -2.0,  0.0],   # 8: left-ish
+        ], dtype=torch.float32)
+
+        self.class_params = nn.Parameter(init)  # [9,4]
+
+    @staticmethod
+    def make_decay_map(h, w, device, dtype):
+        yy, xx = torch.meshgrid(
+            torch.linspace(0.0, 1.0, h, device=device, dtype=dtype),
+            torch.linspace(0.0, 1.0, w, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        # top-left = 1, bottom-right = 0
+        decay = 1.0 - 0.5 * (xx + yy)
+        return decay.clamp(0.0, 1.0)
+
+    @staticmethod
+    def make_base_grid(h, w, device, dtype):
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        return torch.stack([xx, yy], dim=-1)  # [H,W,2]
+
+    def build_flow_from_params(self, params, h, w, device, dtype):
+        ax, ay, cx_raw, cy_raw = params.unbind(dim=0)
+
+        cx = torch.sigmoid(cx_raw)
+        cy = torch.sigmoid(cy_raw)
+
+        decay = self.make_decay_map(h, w, device, dtype)  # [H,W]
+
+        wx = cx + (1.0 - cx) * decay
+        wy = cy + (1.0 - cy) * decay
+
+        dx = ax * wx
+        dy = ay * wy
+
+        flow = torch.stack([dx, dy], dim=-1)  # [H,W,2]
+        aux = {
+            "ax": float(ax.detach().cpu()),
+            "ay": float(ay.detach().cpu()),
+            "cx": float(cx.detach().cpu()),
+            "cy": float(cy.detach().cpu()),
+            "dx": dx.detach(),
+            "dy": dy.detach(),
+        }
+        return flow, aux
+
+    def warp(self, x, flow):
+        """
+        x:    [B,C,H,W]
+        flow: [B,H,W,2] in pixel units
+        """
+        b, c, h, w = x.shape
+        device, dtype = x.device, x.dtype
+
+        base_grid = self.make_base_grid(h, w, device, dtype)
+        base_grid = base_grid.unsqueeze(0).expand(b, h, w, 2).contiguous()
+
+        norm_dx = 2.0 * flow[..., 0] / max(w - 1, 1)
+        norm_dy = 2.0 * flow[..., 1] / max(h - 1, 1)
+
+        grid = base_grid.clone()
+        grid[..., 0] += norm_dx
+        grid[..., 1] += norm_dy
+
+        warped = F.grid_sample(
+            x,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+        return warped
+
+    def forward(self, predictor, gt):
+        """
+        predictor, gt: [B,C,H,W]
+        """
+        b, c, h, w = predictor.shape
+        device, dtype = predictor.device, predictor.dtype
+
+        all_warped = []
+        all_mse = []
+        all_flow = []
+        all_aux = []
+
+        for k in range(self.num_classes):
+            flow_k, aux_k = self.build_flow_from_params(
+                self.class_params[k], h, w, device, dtype
+            )  # [H,W,2]
+
+            flow_k_b = flow_k.unsqueeze(0).expand(b, h, w, 2)
+            warped_k = self.warp(predictor, flow_k_b)
+            mse_k = ((warped_k - gt) ** 2).mean(dim=(1, 2, 3))  # [B]
+
+            all_warped.append(warped_k)
+            all_mse.append(mse_k)
+            all_flow.append(flow_k.detach())
+            all_aux.append(aux_k)
+
+        all_warped = torch.stack(all_warped, dim=1)  # [B,9,C,H,W]
+        all_mse = torch.stack(all_mse, dim=1)        # [B,9]
+
+        best_idx = all_mse.argmin(dim=1)             # [B]
+        best_mse = all_mse.gather(1, best_idx[:, None]).squeeze(1)
+
+        gather_idx = best_idx.view(b, 1, 1, 1, 1).expand(b, 1, c, h, w)
+        best_warped = all_warped.gather(1, gather_idx).squeeze(1)
+
+        return {
+            "best_warped": best_warped,
+            "best_idx": best_idx,
+            "best_mse": best_mse,
+            "all_mse": all_mse,
+            "all_warped": all_warped,
+            "all_flow": all_flow,
+            "all_aux": all_aux,
+        }
+
+
+# =========================================================
+# 2) Classification network
+# =========================================================
+class MergeRefineClassifier(nn.Module):
+    """
+    입력:
+      predictor : [B,1,H,W]
+      top_map   : [B,1,H,W]
+      left_map  : [B,1,H,W]
+
+    출력:
+      logits    : [B,9]
+    """
+    def __init__(self, in_channels=3, num_classes=9, hidden=32):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(hidden, hidden * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(hidden * 2, hidden * 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden * 2, num_classes),
+        )
+
+    def forward(self, predictor, top_map, left_map):
+        x = torch.cat([predictor, top_map, left_map], dim=1)
+        feat = self.features(x)
+        logits = self.classifier(feat)
+        return logits
+
+
+# =========================================================
+# 3) Utility functions
+# =========================================================
+def build_boundary_maps(top_row, left_col, h, w):
+    """
+    top_row : [B,1,1,W]
+    left_col: [B,1,H,1]
+
+    return:
+      top_map  : [B,1,H,W]
+      left_map : [B,1,H,W]
+    """
+    b = top_row.size(0)
+    device = top_row.device
+    dtype = top_row.dtype
+
+    top_map = torch.zeros((b, 1, h, w), device=device, dtype=dtype)
+    left_map = torch.zeros((b, 1, h, w), device=device, dtype=dtype)
+
+    top_map[:, :, 0:1, :] = top_row
+    left_map[:, :, :, 0:1] = left_col
+
+    return top_map, left_map
+
+
+def make_demo_batch(batch_size=64, h=32, w=32, device="cpu"):
+    """
+    toy predictor / gt / boundary 생성
+    gt를 만들고 predictor를 약간 misalign해서 refine이 먹도록 구성
+    """
+    predictors = []
+    gts = []
+    top_rows = []
+    left_cols = []
+
+    yy, xx = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32, device=device),
+        torch.arange(w, dtype=torch.float32, device=device),
+        indexing="ij"
+    )
+
+    for i in range(batch_size):
+        # 랜덤 구조 만들기
+        gx = torch.rand(1, device=device).item() * 0.4 + 0.1
+        gy = torch.rand(1, device=device).item() * 0.4 + 0.1
+        thr = torch.rand(1, device=device).item() * 0.8 + 0.6
+        cx = torch.rand(1, device=device).item() * w
+        cy = torch.rand(1, device=device).item() * h
+        sigma = torch.rand(1, device=device).item() * 4 + 3
+
+        gt = (
+            0.15
+            + gx * (xx / (w - 1))
+            + gy * (yy / (h - 1))
+            + 0.20 * ((xx + yy) > (thr * w)).float()
+        )
+
+        rr = ((xx - cx) ** 2 + (yy - cy) ** 2).sqrt()
+        gt = gt + 0.25 * torch.exp(-(rr ** 2) / (2 * sigma ** 2))
+        gt = gt.clamp(0.0, 1.0)
+
+        # predictor를 GT에서 약간 shifted / blurred
+        sx = int(torch.randint(low=-1, high=2, size=(1,), device=device).item())
+        sy = int(torch.randint(low=-1, high=2, size=(1,), device=device).item())
+        predictor = torch.roll(gt, shifts=(sy, sx), dims=(0, 1))
+        predictor = 0.85 * predictor + 0.15 * torch.roll(predictor, shifts=(0, 1), dims=(0, 1))
+        predictor = predictor.clamp(0.0, 1.0)
+
+        # boundary는 gt 주변 recon이라고 가정한 toy 값
+        top_row = gt[0:1, :].clone().unsqueeze(0).unsqueeze(0)   # [1,1,1,W]
+        left_col = gt[:, 0:1].clone().unsqueeze(0).unsqueeze(0)  # [1,1,H,1]
+
+        predictors.append(predictor.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
+        gts.append(gt.unsqueeze(0).unsqueeze(0))
+        top_rows.append(top_row)
+        left_cols.append(left_col)
+
+    predictor = torch.cat(predictors, dim=0)
+    gt = torch.cat(gts, dim=0)
+    top_row = torch.cat(top_rows, dim=0)
+    left_col = torch.cat(left_cols, dim=0)
+
+    return predictor, gt, top_row, left_col
+
+
+def topk_recall(logits, target, k=3):
+    topk = logits.topk(k=k, dim=1).indices
+    hit = (topk == target.unsqueeze(1)).any(dim=1).float().mean()
+    return float(hit.item())
+
+
+# =========================================================
+# 4) Visualization
+# =========================================================
+def visualize_oracle_and_classifier(oracle_model, classifier, predictor, gt, top_row, left_col, sample_idx=0):
+    with torch.no_grad():
+        oracle_out = oracle_model(predictor, gt)
+
+        b, c, h, w = predictor.shape
+        top_map, left_map = build_boundary_maps(top_row, left_col, h, w)
+        logits = classifier(predictor, top_map, left_map)
+        pred_idx = logits.argmax(dim=1)
+
+    pred_img = predictor[sample_idx, 0].cpu()
+    gt_img = gt[sample_idx, 0].cpu()
+    best_idx = int(oracle_out["best_idx"][sample_idx].item())
+    cls_idx = int(pred_idx[sample_idx].item())
+
+    fig, axes = plt.subplots(2, 6, figsize=(18, 6))
+
+    axes[0, 0].imshow(pred_img, cmap="gray", vmin=0, vmax=1)
+    axes[0, 0].set_title("Predictor")
+    axes[0, 1].imshow(gt_img, cmap="gray", vmin=0, vmax=1)
+    axes[0, 1].set_title("GT")
+
+    best_img = oracle_out["best_warped"][sample_idx, 0].cpu()
+    axes[0, 2].imshow(best_img, cmap="gray", vmin=0, vmax=1)
+    axes[0, 2].set_title(f"Oracle best\nclass={best_idx}")
+
+    cls_img = oracle_out["all_warped"][sample_idx, cls_idx, 0].cpu()
+    axes[0, 3].imshow(cls_img, cmap="gray", vmin=0, vmax=1)
+    axes[0, 3].set_title(f"Classifier pred\nclass={cls_idx}")
+
+    axes[0, 4].imshow((best_img - gt_img).abs(), cmap="magma")
+    axes[0, 4].set_title("|Oracle - GT|")
+
+    axes[0, 5].imshow((cls_img - gt_img).abs(), cmap="magma")
+    axes[0, 5].set_title("|ClsPred - GT|")
+
+    for k in range(6):
+        axes[0, k].axis("off")
+
+    for k in range(6):
+        class_id = k
+        if class_id >= oracle_model.num_classes:
+            axes[1, k].axis("off")
+            continue
+        warped = oracle_out["all_warped"][sample_idx, class_id, 0].cpu()
+        mse = float(oracle_out["all_mse"][sample_idx, class_id].item())
+        axes[1, k].imshow(warped, cmap="gray", vmin=0, vmax=1)
+        axes[1, k].set_title(f"class {class_id}\nMSE={mse:.4f}")
+        axes[1, k].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================================================
+# 5) Training
+# =========================================================
+def train_classifier(
+    epochs=20,
+    batch_size=128,
+    h=32,
+    w=32,
+    lr=1e-3,
+    device="cpu",
+):
+    oracle_model = MergeRefineOracle4Param().to(device)
+    classifier = MergeRefineClassifier(in_channels=3, num_classes=9, hidden=32).to(device)
+
+    optimizer = torch.optim.Adam(classifier.parameters(), lr=lr)
+
+    # 고정 train batch 여러 개 미리 생성
+    train_data = [make_demo_batch(batch_size=batch_size, h=h, w=w, device=device) for _ in range(20)]
+    val_data = make_demo_batch(batch_size=batch_size, h=h, w=w, device=device)
+
+    for epoch in range(1, epochs + 1):
+        classifier.train()
+        total_loss = 0.0
+        total_acc = 0.0
+        total_top3 = 0.0
+
+        for predictor, gt, top_row, left_col in train_data:
+            with torch.no_grad():
+                oracle_out = oracle_model(predictor, gt)
+                target_idx = oracle_out["best_idx"]  # [B]
+
+            b, c, hh, ww = predictor.shape
+            top_map, left_map = build_boundary_maps(top_row, left_col, hh, ww)
+
+            logits = classifier(predictor, top_map, left_map)
+            loss = F.cross_entropy(logits, target_idx)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            pred_idx = logits.argmax(dim=1)
+            acc = (pred_idx == target_idx).float().mean().item()
+            t3 = topk_recall(logits, target_idx, k=3)
+
+            total_loss += loss.item()
+            total_acc += acc
+            total_top3 += t3
+
+        total_loss /= len(train_data)
+        total_acc /= len(train_data)
+        total_top3 /= len(train_data)
+
+        # validation
+        classifier.eval()
+        with torch.no_grad():
+            predictor, gt, top_row, left_col = val_data
+            oracle_out = oracle_model(predictor, gt)
+            target_idx = oracle_out["best_idx"]
+
+            b, c, hh, ww = predictor.shape
+            top_map, left_map = build_boundary_maps(top_row, left_col, hh, ww)
+
+            logits = classifier(predictor, top_map, left_map)
+            val_loss = F.cross_entropy(logits, target_idx).item()
+            val_acc = (logits.argmax(dim=1) == target_idx).float().mean().item()
+            val_top3 = topk_recall(logits, target_idx, k=3)
+
+        print(
+            f"[Epoch {epoch:02d}] "
+            f"train_loss={total_loss:.4f} "
+            f"train_acc={total_acc:.4f} "
+            f"train_top3={total_top3:.4f} | "
+            f"val_loss={val_loss:.4f} "
+            f"val_acc={val_acc:.4f} "
+            f"val_top3={val_top3:.4f}"
+        )
+
+    return oracle_model, classifier, val_data
+
+
+# =========================================================
+# 6) Main
+# =========================================================
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    oracle_model, classifier, val_data = train_classifier(
+        epochs=20,
+        batch_size=128,
+        h=32,
+        w=32,
+        lr=1e-3,
+        device=device,
+    )
+
+    predictor, gt, top_row, left_col = val_data
+
+    visualize_oracle_and_classifier(
+        oracle_model=oracle_model,
+        classifier=classifier,
+        predictor=predictor,
+        gt=gt,
+        top_row=top_row,
+        left_col=left_col,
+        sample_idx=0,
+    )
