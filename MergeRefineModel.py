@@ -1,3 +1,22 @@
+import torch
+
+# a: (h+3, w+3)
+# b: (h, w)
+
+a_part = torch.cat([
+    a[3:, :3],      # (h, 3)
+    a[:3, 3:].T     # (w, 3)
+], dim=0)           # (h+w, 3)
+
+b_part = torch.cat([
+    b[:, :3],       # (h, 3)
+    b[:3, :].T      # (w, 3)
+], dim=0)           # (h+w, 3)
+
+out = torch.cat([a_part, b_part], dim=1)   # (h+w, 6)
+
+
+
 import math
 import torch
 import torch.nn as nn
