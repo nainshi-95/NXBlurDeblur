@@ -1,4 +1,244 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BoundaryWarpRegressor(nn.Module):
+    """
+    Input:
+        left_pred  : [B, 1, H, K]
+        left_recon : [B, 1, H, K]
+        top_pred   : [B, 1, K, W]
+        top_recon  : [B, 1, K, W]
+        predictor  : [B, C, H, W]
+
+    Output:
+        warped predictor
+        dense flow [B, H, W, 2]
+        boundary-only shifts
+    """
+
+    def __init__(
+        self,
+        band_size=3,
+        hidden=64,
+        num_layers=4,
+        max_shift_x=0.75,
+        max_shift_y=0.75,
+    ):
+        super().__init__()
+        self.band = band_size
+        self.max_shift_x = max_shift_x
+        self.max_shift_y = max_shift_y
+
+        layers = []
+        in_ch = 6  # [pred_3, recon_3]
+        ch = hidden
+        layers.append(nn.Conv1d(in_ch, ch, kernel_size=3, padding=1))
+        layers.append(nn.GELU())
+
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv1d(ch, ch, kernel_size=3, padding=1))
+            layers.append(nn.GELU())
+
+        self.backbone = nn.Sequential(*layers)
+
+        # left sequence head: outputs K*2 per row-token
+        self.left_head = nn.Conv1d(ch, band_size * 2, kernel_size=1)
+
+        # top sequence head: outputs K*2 per col-token
+        self.top_head = nn.Conv1d(ch, band_size * 2, kernel_size=1)
+
+        # optional confidence / enable strength
+        self.gate_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(ch, 1, kernel_size=1),
+        )
+
+    @staticmethod
+    def make_base_grid(h, w, device, dtype):
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype),
+            indexing="ij"
+        )
+        return torch.stack([xx, yy], dim=-1)  # [H,W,2]
+
+    @staticmethod
+    def warp(x, flow):
+        """
+        x    : [B,C,H,W]
+        flow : [B,H,W,2] in pixel units
+        """
+        b, c, h, w = x.shape
+        device, dtype = x.device, x.dtype
+
+        base_grid = BoundaryWarpRegressor.make_base_grid(h, w, device, dtype)
+        base_grid = base_grid.unsqueeze(0).expand(b, h, w, 2).contiguous()
+
+        norm_dx = 2.0 * flow[..., 0] / max(w - 1, 1)
+        norm_dy = 2.0 * flow[..., 1] / max(h - 1, 1)
+
+        grid = base_grid.clone()
+        grid[..., 0] += norm_dx
+        grid[..., 1] += norm_dy
+
+        warped = F.grid_sample(
+            x,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True
+        )
+        return warped
+
+    def build_feature_sequence(self, left_pred, left_recon, top_pred, top_recon):
+        """
+        Build [B, 6, H+W]
+        left side: per row, 6-dim = [pred3, recon3]
+        top side : per col, 6-dim = [pred3, recon3]
+        """
+        b, c, h, k = left_pred.shape
+        _, _, k2, w = top_pred.shape
+        assert c == 1, "현재 코드는 입력 boundary feature를 1채널 기준으로 작성"
+        assert k == self.band and k2 == self.band
+
+        # left: [B,1,H,K] -> [B,H,K]
+        lp = left_pred[:, 0]    # [B,H,K]
+        lr = left_recon[:, 0]   # [B,H,K]
+
+        # top : [B,1,K,W] -> [B,W,K]
+        tp = top_pred[:, 0].permute(0, 2, 1).contiguous()   # [B,W,K]
+        tr = top_recon[:, 0].permute(0, 2, 1).contiguous()  # [B,W,K]
+
+        # per token feature dim = 2K = 6
+        left_feat = torch.cat([lp, lr], dim=-1)  # [B,H,6]
+        top_feat = torch.cat([tp, tr], dim=-1)   # [B,W,6]
+
+        seq = torch.cat([left_feat, top_feat], dim=1)   # [B,H+W,6]
+        seq = seq.permute(0, 2, 1).contiguous()         # [B,6,H+W]
+        return seq
+
+    def build_dense_flow(self, left_shift, top_shift, h, w, device, dtype):
+        """
+        left_shift:
+            dx_left [B,H,K], dy_left [B,H,K]
+        top_shift:
+            dx_top  [B,K,W], dy_top  [B,K,W]
+
+        Returns:
+            dense flow [B,H,W,2], only left/top bands are nonzero.
+            overlap(top-left corner) is averaged.
+        """
+        dx_left, dy_left = left_shift
+        dx_top, dy_top = top_shift
+
+        b = dx_left.shape[0]
+        k = self.band
+
+        flow_x = torch.zeros((b, h, w), device=device, dtype=dtype)
+        flow_y = torch.zeros((b, h, w), device=device, dtype=dtype)
+        weight = torch.zeros((b, h, w), device=device, dtype=dtype)
+
+        # left band
+        flow_x[:, :, :k] += dx_left
+        flow_y[:, :, :k] += dy_left
+        weight[:, :, :k] += 1.0
+
+        # top band
+        flow_x[:, :k, :] += dx_top
+        flow_y[:, :k, :] += dy_top
+        weight[:, :k, :] += 1.0
+
+        weight = torch.clamp(weight, min=1.0)
+        flow_x = flow_x / weight
+        flow_y = flow_y / weight
+
+        flow = torch.stack([flow_x, flow_y], dim=-1)  # [B,H,W,2]
+        return flow
+
+    def forward(self, predictor, left_pred, left_recon, top_pred, top_recon):
+        """
+        predictor  : [B,C,H,W]
+        left_pred  : [B,1,H,K]
+        left_recon : [B,1,H,K]
+        top_pred   : [B,1,K,W]
+        top_recon  : [B,1,K,W]
+        """
+        b, c, h, w = predictor.shape
+        device, dtype = predictor.device, predictor.dtype
+        k = self.band
+
+        seq = self.build_feature_sequence(left_pred, left_recon, top_pred, top_recon)  # [B,6,H+W]
+        feat = self.backbone(seq)  # [B,hidden,H+W]
+
+        # split tokens
+        feat_left = feat[:, :, :h]     # [B,hidden,H]
+        feat_top = feat[:, :, h:h+w]   # [B,hidden,W]
+
+        # gate
+        gate = torch.sigmoid(self.gate_head(feat)).view(b, 1, 1)  # [B,1,1]
+
+        # left output: [B,2K,H] -> [B,H,K,2]
+        left_raw = self.left_head(feat_left).permute(0, 2, 1).contiguous()
+        left_raw = left_raw.view(b, h, k, 2)
+
+        # top output: [B,2K,W] -> [B,W,K,2] -> [B,K,W,2]
+        top_raw = self.top_head(feat_top).permute(0, 2, 1).contiguous()
+        top_raw = top_raw.view(b, w, k, 2).permute(0, 2, 1, 3).contiguous()
+
+        # bounded regression
+        dx_left = torch.tanh(left_raw[..., 0]) * self.max_shift_x * gate
+        dy_left = torch.tanh(left_raw[..., 1]) * self.max_shift_y * gate
+
+        dx_top = torch.tanh(top_raw[..., 0]) * self.max_shift_x * gate
+        dy_top = torch.tanh(top_raw[..., 1]) * self.max_shift_y * gate
+
+        flow = self.build_dense_flow(
+            left_shift=(dx_left, dy_left),
+            top_shift=(dx_top, dy_top),
+            h=h,
+            w=w,
+            device=device,
+            dtype=dtype,
+        )
+
+        warped = self.warp(predictor, flow)
+
+        return {
+            "warped": warped,
+            "flow": flow,
+            "dx_left": dx_left,
+            "dy_left": dy_left,
+            "dx_top": dx_top,
+            "dy_top": dy_top,
+            "gate": gate.squeeze(-1),
+        }
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
 
 # a: (h+3, w+3)
 # b: (h, w)
