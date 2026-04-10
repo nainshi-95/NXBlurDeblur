@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 
 # =========================================================
-# 1) basic utils
+# 1) basic ops
 # =========================================================
 def conv2_same(img, kernel):
     H, W = img.shape
@@ -18,10 +18,16 @@ def conv2_same(img, kernel):
 
 
 def sobel_x(img):
-    # horizontal gradient -> vertical edge detection
     k = np.array([[1, 0, -1],
                   [2, 0, -2],
                   [1, 0, -1]], dtype=np.float64) / 4.0
+    return conv2_same(img, k)
+
+
+def sobel_y(img):
+    k = np.array([[1, 2, 1],
+                  [0, 0, 0],
+                  [-1, -2, -1]], dtype=np.float64) / 4.0
     return conv2_same(img, k)
 
 
@@ -60,26 +66,10 @@ def shift_patch(img, dx=0.0, dy=0.0):
     return bilinear_sample(img, yy - dy, xx - dx)
 
 
-def shift_1d(arr, dy):
-    """
-    arr: [k]
-    out[y] = arr[y-dy]
-    """
-    k = len(arr)
-    y = np.arange(k, dtype=np.float64)
-    src = np.clip(y - dy, 0, k - 1)
-
-    y0 = np.floor(src).astype(int)
-    y1 = np.clip(y0 + 1, 0, k - 1)
-    w = src - y0
-
-    return arr[y0] * (1 - w) + arr[y1] * w
-
-
 # =========================================================
 # 2) synthetic data
 # =========================================================
-def make_edge_image(H=64, W=16, theta_deg=18, edge_x0=2.6, softness=0.8):
+def make_edge_image(H=64, W=16, theta_deg=20, edge_x0=2.7, softness=0.8):
     """
     theta_deg: angle of edge normal
     """
@@ -90,13 +80,13 @@ def make_edge_image(H=64, W=16, theta_deg=18, edge_x0=2.6, softness=0.8):
     return img
 
 
-def make_kx6_left_boundary_case(k=48, true_dy=0.5, angle_deg=18):
+def make_kx6_left_boundary_case(k=48, true_dy=0.5, angle_deg=20):
     """
-    left 3 cols: reference
+    left 3 cols : reference
     right 3 cols: predictor
     predictor side has vertical misalignment true_dy
     """
-    base = make_edge_image(H=64, W=16, theta_deg=angle_deg, edge_x0=2.6, softness=0.8)
+    base = make_edge_image(H=64, W=16, theta_deg=angle_deg, edge_x0=2.7, softness=0.8)
 
     y0 = (64 - k) // 2
     y1 = y0 + k
@@ -107,34 +97,11 @@ def make_kx6_left_boundary_case(k=48, true_dy=0.5, angle_deg=18):
     left = ref_full[y0:y1, 0:3]
     right = pred_full[y0:y1, 3:6]
     patch = np.concatenate([left, right], axis=1)
-
     return left, right, patch
 
 
 # =========================================================
-# 3) soft edge trajectory extraction
-# =========================================================
-def extract_edge_curve(strip3, eps=1e-6):
-    """
-    strip3: [k,3]
-
-    returns:
-      pos      : [k] soft edge position inside 3-col strip
-      strength : [k] row-wise edge strength
-      gx_abs   : [k,3]
-    """
-    gx = sobel_x(strip3)
-    gx_abs = np.abs(gx) + eps
-
-    xs = np.arange(3, dtype=np.float64)[None, :]
-    pos = (gx_abs * xs).sum(axis=1) / gx_abs.sum(axis=1)
-    strength = gx_abs.max(axis=1)
-
-    return pos, strength, gx_abs
-
-
-# =========================================================
-# 4) 3-way score using position + slope continuity
+# 3) orientation-guided interpolation score
 # =========================================================
 CANDIDATES = {
     "up":   -0.5,
@@ -143,73 +110,197 @@ CANDIDATES = {
 }
 
 
-def trajectory_score(left, right, cand_dy,
-                     strength_tau=0.02,
-                     alpha=2.0,   # position mismatch weight
-                     beta=1.2,    # slope mismatch weight
-                     gamma=0.5):  # seam intensity weight
+def estimate_row_orientation(patch6, eps=1e-6):
     """
-    left, right: [k,3]
-    cand_dy: correction applied to right side
+    patch6: [k,6]
+    For each row, estimate edge normal from seam-near region.
+    returns:
+      nx, ny, mag: [k]
+    """
+    gx = sobel_x(patch6)
+    gy = sobel_y(patch6)
+    mag = np.sqrt(gx**2 + gy**2) + eps
 
+    # seam-near columns: 2 and 3
+    cols = [2, 3]
+    w = mag[:, cols]
+    gxw = gx[:, cols]
+    gyw = gy[:, cols]
+
+    nx = (gxw * w).sum(axis=1) / (w.sum(axis=1) + eps)
+    ny = (gyw * w).sum(axis=1) / (w.sum(axis=1) + eps)
+
+    norm = np.sqrt(nx**2 + ny**2) + eps
+    nx = nx / norm
+    ny = ny / norm
+    mag_row = w.mean(axis=1)
+
+    return nx, ny, mag_row
+
+
+def sample_profiles_for_row(left, right_shifted, y, nx, ny,
+                            normal_offsets=(-1.5, -0.5, 0.5, 1.5),
+                            tangent_offsets=(-1.0, 0.0, 1.0)):
+    """
+    left, right_shifted: [k,3]
+    y: scalar row center
+    nx, ny: normal direction for this row
+
+    seam-adjacent anchor points:
+      left  anchor at x=2
+      right anchor at x=0
+
+    normal profile: sample across edge normal
+    tangent profile: sample along edge tangent
+    """
+    # tangent direction = rotate normal by +90 deg
+    tx, ty = -ny, nx
+
+    # anchor points in local strip coordinates
+    lx0, rx0 = 2.0, 0.0
+    ly0, ry0 = float(y), float(y)
+
+    left_normal = []
+    right_normal = []
+
+    for s in normal_offsets:
+        left_normal.append(
+            bilinear_sample(left,
+                            np.array([[ly0 + s * ny]]),
+                            np.array([[lx0 + s * nx]])).item()
+        )
+        right_normal.append(
+            bilinear_sample(right_shifted,
+                            np.array([[ry0 + s * ny]]),
+                            np.array([[rx0 + s * nx]])).item()
+        )
+
+    left_tangent = []
+    right_tangent = []
+
+    for s in tangent_offsets:
+        left_tangent.append(
+            bilinear_sample(left,
+                            np.array([[ly0 + s * ty]]),
+                            np.array([[lx0 + s * tx]])).item()
+        )
+        right_tangent.append(
+            bilinear_sample(right_shifted,
+                            np.array([[ry0 + s * ty]]),
+                            np.array([[rx0 + s * tx]])).item()
+        )
+
+    return (
+        np.array(left_normal, dtype=np.float64),
+        np.array(right_normal, dtype=np.float64),
+        np.array(left_tangent, dtype=np.float64),
+        np.array(right_tangent, dtype=np.float64),
+    )
+
+
+def candidate_score(left, right, cand_dy,
+                    mag_tau=0.03,
+                    normal_offsets=(-1.5, -0.5, 0.5, 1.5),
+                    tangent_offsets=(-1.0, 0.0, 1.0),
+                    alpha=1.6,   # normal profile consistency
+                    beta=1.0,    # tangent profile consistency
+                    gamma=0.4):  # seam raw intensity jump
+    """
     lower is better
     """
-    pL, sL, _ = extract_edge_curve(left)
-    pR, sR, _ = extract_edge_curve(right)
+    right_shifted = shift_patch(right, dx=0.0, dy=cand_dy)
+    patch6 = np.concatenate([left, right_shifted], axis=1)
 
-    # shift right trajectory by candidate dy
-    pR_shift = shift_1d(pR, cand_dy)
-    sR_shift = shift_1d(sR, cand_dy)
+    nx, ny, mag_row = estimate_row_orientation(patch6)
+    k = left.shape[0]
 
-    # row weights: only trust rows where both sides have edge
-    w = np.minimum(sL, sR_shift)
-    mask = (w > strength_tau).astype(np.float64)
-    wm = w * mask
-    wm_sum = max(wm.sum(), 1e-6)
+    total_normal = 0.0
+    total_tangent = 0.0
+    total_seam = 0.0
+    total_w = 0.0
 
-    # 1) position continuity
-    pos_term = (np.abs(pL - pR_shift) * wm).sum() / wm_sum
+    used_rows = []
+    debug_profiles = None
 
-    # 2) slope continuity: trend of edge movement across rows
-    dpL = np.diff(pL)
-    dpR = np.diff(pR_shift)
+    for y in range(1, k - 1):
+        w = mag_row[y]
+        if w < mag_tau:
+            continue
 
-    w2 = np.minimum(w[:-1], w[1:])
-    mask2 = (w2 > strength_tau).astype(np.float64)
-    wm2 = w2 * mask2
-    wm2_sum = max(wm2.sum(), 1e-6)
+        ln, rn, lt, rt = sample_profiles_for_row(
+            left, right_shifted, y, nx[y], ny[y],
+            normal_offsets=normal_offsets,
+            tangent_offsets=tangent_offsets,
+        )
 
-    slope_term = (np.abs(dpL - dpR) * wm2).sum() / wm2_sum
+        normal_err = np.mean(np.abs(ln - rn))
+        tangent_err = np.mean(np.abs(lt - rt))
+        seam_err = abs(left[y, 2] - right_shifted[y, 0])
 
-    # 3) seam intensity continuity
-    # compare seam-adjacent columns after shifting right[:,0]
-    r0_shift = shift_1d(right[:, 0], cand_dy)
-    seam_term = np.mean(np.abs(left[:, 2] - r0_shift))
+        total_normal += w * normal_err
+        total_tangent += w * tangent_err
+        total_seam += w * seam_err
+        total_w += w
 
-    total = alpha * pos_term + beta * slope_term + gamma * seam_term
+        used_rows.append(y)
+
+        # keep one middle-row profile for visualization
+        if debug_profiles is None and abs(y - k // 2) <= 2:
+            debug_profiles = {
+                "y": y,
+                "ln": ln,
+                "rn": rn,
+                "lt": lt,
+                "rt": rt,
+                "nx": nx[y],
+                "ny": ny[y],
+            }
+
+    if total_w < 1e-8:
+        # no reliable edge rows
+        return {
+            "total": 1e9,
+            "normal_term": 1e9,
+            "tangent_term": 1e9,
+            "seam_term": 1e9,
+            "right_shifted": right_shifted,
+            "patch6": patch6,
+            "used_rows": used_rows,
+            "debug_profiles": debug_profiles,
+            "nx": nx,
+            "ny": ny,
+            "mag_row": mag_row,
+        }
+
+    normal_term = total_normal / total_w
+    tangent_term = total_tangent / total_w
+    seam_term = total_seam / total_w
+
+    total = alpha * normal_term + beta * tangent_term + gamma * seam_term
 
     return {
         "total": total,
-        "pos_term": pos_term,
-        "slope_term": slope_term,
+        "normal_term": normal_term,
+        "tangent_term": tangent_term,
         "seam_term": seam_term,
-        "pL": pL,
-        "pR": pR,
-        "pR_shift": pR_shift,
-        "sL": sL,
-        "sR": sR,
-        "w": w,
+        "right_shifted": right_shifted,
+        "patch6": patch6,
+        "used_rows": used_rows,
+        "debug_profiles": debug_profiles,
+        "nx": nx,
+        "ny": ny,
+        "mag_row": mag_row,
     }
 
 
 def score_3way(left, right):
     out = {}
     for name, dy in CANDIDATES.items():
-        out[name] = trajectory_score(left, right, dy)
+        out[name] = candidate_score(left, right, dy)
     return out
 
 
-def decide_3way(left, right, threshold=0.01):
+def decide_3way(left, right, threshold=0.005):
     """
     gain-based decision relative to stop
     """
@@ -232,16 +323,6 @@ def decide_3way(left, right, threshold=0.01):
     return pred, scored, gain_up, gain_down
 
 
-# =========================================================
-# 5) visualization helpers
-# =========================================================
-def make_corrected_patch(left, right, pred_label):
-    dy = CANDIDATES[pred_label]
-    right_corr = np.stack([shift_1d(right[:, x], dy) for x in range(3)], axis=1)
-    patch_corr = np.concatenate([left, right_corr], axis=1)
-    return right_corr, patch_corr
-
-
 def true_label_from_true_dy(true_dy, tol=0.25):
     if true_dy < -tol:
         return "up"
@@ -251,8 +332,11 @@ def true_label_from_true_dy(true_dy, tol=0.25):
         return "stop"
 
 
-def visualize_cases(cases, threshold=0.01, save_path=None):
-    fig, axes = plt.subplots(len(cases), 5, figsize=(20, 3.6 * len(cases)))
+# =========================================================
+# 4) visualization
+# =========================================================
+def visualize_cases(cases, threshold=0.005, save_path=None):
+    fig, axes = plt.subplots(len(cases), 5, figsize=(20, 3.8 * len(cases)))
     if len(cases) == 1:
         axes = axes[None, :]
 
@@ -268,7 +352,8 @@ def visualize_cases(cases, threshold=0.01, save_path=None):
         pred, scored, gain_up, gain_down = decide_3way(left, right, threshold=threshold)
         gt_label = true_label_from_true_dy(true_dy)
 
-        right_corr, patch_corr = make_corrected_patch(left, right, pred)
+        best = scored[pred]
+        patch_corr = best["patch6"]
 
         # panel 1: input patch
         ax = axes[row, 0]
@@ -297,36 +382,48 @@ def visualize_cases(cases, threshold=0.01, save_path=None):
         ax.set_title("candidate score")
         ax.set_ylabel("lower is better")
 
-        # panel 4: raw trajectories
+        # panel 4: row-wise edge strength
         ax = axes[row, 3]
-        y = np.arange(len(scored[pred]["pL"]))
-        ax.plot(scored[pred]["pL"], y, label="left curve")
-        ax.plot(scored[pred]["pR"], y, label="right curve raw")
-        ax.invert_yaxis()
-        ax.set_xlabel("edge pos in 3-col strip")
-        ax.set_title("raw edge trajectory")
-        ax.legend(fontsize=8)
-
-        # panel 5: aligned trajectories
-        ax = axes[row, 4]
-        ax.plot(scored[pred]["pL"], y, label="left curve")
-        ax.plot(scored[pred]["pR_shift"], y, label=f"right shifted ({pred})")
-        ax.invert_yaxis()
-        ax.set_xlabel("edge pos in 3-col strip")
+        ax.plot(best["mag_row"], label="edge strength")
+        for yy in best["used_rows"]:
+            ax.axvline(yy, color="gray", alpha=0.05)
         ax.set_title(
-            f"aligned trajectory\n"
             f"gain_up={gain_up:.4f}, gain_down={gain_down:.4f}"
         )
+        ax.set_xlabel("row")
         ax.legend(fontsize=8)
+
+        # panel 5: normal/tangent profiles at one debug row
+        ax = axes[row, 4]
+        dbg = best["debug_profiles"]
+        if dbg is not None:
+            x1 = np.arange(len(dbg["ln"]))
+            x2 = np.arange(len(dbg["lt"]))
+            ax.plot(x1, dbg["ln"], marker="o", label="left normal")
+            ax.plot(x1, dbg["rn"], marker="o", label="right normal")
+            ax.plot(x2, dbg["lt"], marker="x", label="left tangent")
+            ax.plot(x2, dbg["rt"], marker="x", label="right tangent")
+            ax.set_title(
+                f"profiles @ row {dbg['y']}\n"
+                f"n=({dbg['nx']:.2f},{dbg['ny']:.2f})"
+            )
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "no strong edge row", ha="center", va="center")
+            ax.set_title("profiles")
+        ax.set_xlabel("sample index")
 
         summary.append({
             "title": title,
             "true_dy": true_dy,
             "gt_label": gt_label,
             "pred": pred,
-            "scores": {n: scored[n]["total"] for n in names},
+            "scores": {n: scored[n]["total"] for n in ["up", "stop", "down"]},
             "gain_up": gain_up,
             "gain_down": gain_down,
+            "normal_terms": {n: scored[n]["normal_term"] for n in ["up", "stop", "down"]},
+            "tangent_terms": {n: scored[n]["tangent_term"] for n in ["up", "stop", "down"]},
+            "seam_terms": {n: scored[n]["seam_term"] for n in ["up", "stop", "down"]},
         })
 
     plt.tight_layout()
@@ -348,14 +445,31 @@ def visualize_cases(cases, threshold=0.01, save_path=None):
             f"| GT={item['gt_label']} | Pred={item['pred']} | correct={is_correct}"
         )
         print(
-            f"  scores: "
+            f"  total: "
             f"up={item['scores']['up']:.4f}, "
             f"stop={item['scores']['stop']:.4f}, "
             f"down={item['scores']['down']:.4f}"
         )
         print(
-            f"  gains: "
-            f"gain_up={item['gain_up']:.4f}, "
+            f"  normal: "
+            f"up={item['normal_terms']['up']:.4f}, "
+            f"stop={item['normal_terms']['stop']:.4f}, "
+            f"down={item['normal_terms']['down']:.4f}"
+        )
+        print(
+            f"  tangent: "
+            f"up={item['tangent_terms']['up']:.4f}, "
+            f"stop={item['tangent_terms']['stop']:.4f}, "
+            f"down={item['tangent_terms']['down']:.4f}"
+        )
+        print(
+            f"  seam: "
+            f"up={item['seam_terms']['up']:.4f}, "
+            f"stop={item['seam_terms']['stop']:.4f}, "
+            f"down={item['seam_terms']['down']:.4f}"
+        )
+        print(
+            f"  gains: gain_up={item['gain_up']:.4f}, "
             f"gain_down={item['gain_down']:.4f}"
         )
 
@@ -364,7 +478,7 @@ def visualize_cases(cases, threshold=0.01, save_path=None):
 
 
 # =========================================================
-# 6) run
+# 5) run
 # =========================================================
 if __name__ == "__main__":
     cases = [
@@ -373,13 +487,13 @@ if __name__ == "__main__":
         ("true down 0.5px",  0.5, 18),
         ("true up 1.0px",   -1.0, 18),
         ("true down 1.0px",  1.0, 18),
-        ("true down 0.5px, steeper edge",  0.5, 32),
-        ("true up 0.5px, steeper edge",   -0.5, 32),
-        ("true stop, steeper edge",        0.0, 32),
+        ("true up 0.5px, steeper",   -0.5, 32),
+        ("true stop, steeper",        0.0, 32),
+        ("true down 0.5px, steeper",  0.5, 32),
     ]
 
     visualize_cases(
         cases,
-        threshold=0.01,
-        save_path="left_boundary_trajectory_score_test.png"
+        threshold=0.005,
+        save_path="left_boundary_orientation_interp_test.png"
     )
